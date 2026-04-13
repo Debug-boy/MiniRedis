@@ -1,0 +1,126 @@
+测试命令: SET/GET, 默认请求数: 100000
+----------------------------------------
+MiniRedis (Port 9736)...
+  -> 正在运行并发数: 50
+ERROR: ERR unknown command 'CONFIG'
+ERROR: failed to fetch CONFIG from 127.0.0.1:9736
+WARN: could not fetch server CONFIG
+SET: 85034.02 requests per second
+GET: 84961.77 requests per second
+[Port 9736][C 50]
+  -> 正在运行并发数: 100
+ERROR: ERR unknown command 'CONFIG'
+ERROR: failed to fetch CONFIG from 127.0.0.1:9736
+WARN: could not fetch server CONFIG
+SET: 83542.19 requests per second
+GET: 84245.99 requests per second
+[Port 9736][C 100]
+  -> 正在运行并发数: 200
+ERROR: ERR unknown command 'CONFIG'
+ERROR: failed to fetch CONFIG from 127.0.0.1:9736
+WARN: could not fetch server CONFIG
+SET: 82781.46 requests per second
+GET: 78864.35 requests per second
+[Port 9736][C 200]
+  -> 正在运行并发数: 400
+ERROR: ERR unknown command 'CONFIG'
+ERROR: failed to fetch CONFIG from 127.0.0.1:9736
+WARN: could not fetch server CONFIG
+SET: 73260.07 requests per second
+GET: 75528.70 requests per second
+[Port 9736][C 400]
+  -> 正在运行并发数: 600
+ERROR: ERR unknown command 'CONFIG'
+ERROR: failed to fetch CONFIG from 127.0.0.1:9736
+WARN: could not fetch server CONFIG
+SET: 70671.38 requests per second
+GET: 71839.09 requests per second
+[Port 9736][C 600]
+  -> 正在运行并发数: 800
+ERROR: ERR unknown command 'CONFIG'
+ERROR: failed to fetch CONFIG from 127.0.0.1:9736
+WARN: could not fetch server CONFIG
+SET: 66445.18 requests per second
+GET: 64892.93 requests per second
+[Port 9736][C 800]
+  -> 正在运行并发数: 1000
+ERROR: ERR unknown command 'CONFIG'
+ERROR: failed to fetch CONFIG from 127.0.0.1:9736
+WARN: could not fetch server CONFIG
+SET: 65359.48 requests per second
+GET: 63251.11 requests per second
+[Port 9736][C 1000]
+  -> 正在运行并发数: 1500
+ERROR: ERR unknown command 'CONFIG'
+ERROR: failed to fetch CONFIG from 127.0.0.1:9736
+WARN: could not fetch server CONFIG
+SET: 61162.08 requests per second
+GET: 61614.29 requests per second
+[Port 9736][C 1500]
+  -> 正在运行并发数: 3000
+ERROR: ERR unknown command 'CONFIG'
+ERROR: failed to fetch CONFIG from 127.0.0.1:9736
+WARN: could not fetch server CONFIG
+SET: 51546.39 requests per second
+GET: 51759.83 requests per second
+[Port 9736][C 3000]
+  -> 正在运行并发数: 5000
+ERROR: ERR unknown command 'CONFIG'
+ERROR: failed to fetch CONFIG from 127.0.0.1:9736
+WARN: could not fetch server CONFIG
+SET: 56274.62 requests per second
+GET: 57208.24 requests per second
+[Port 9736][C 5000]
+  -> 正在运行并发数: 10000
+ERROR: ERR unknown command 'CONFIG'
+ERROR: failed to fetch CONFIG from 127.0.0.1:9736
+WARN: could not fetch server CONFIG
+SET: 54229.93 requests per second
+GET: 55463.12 requests per second
+[Port 9736][C 10000]
+MiniRedis 测试完成
+----------------------------------------
+正在测试官方 Redis 8.0 (Port 6379)...
+  -> 正在运行并发数: 50
+SET: 81168.83 requests per second
+GET: 82372.32 requests per second
+[Port 6379][C 50]
+  -> 正在运行并发数: 100
+SET: 84033.61 requests per second
+GET: 81168.83 requests per second
+[Port 6379][C 100]
+  -> 正在运行并发数: 200
+SET: 78125.00 requests per second
+GET: 76863.95 requests per second
+[Port 6379][C 200]
+  -> 正在运行并发数: 400
+SET: 67340.07 requests per second
+GET: 70721.36 requests per second
+[Port 6379][C 400]
+  -> 正在运行并发数: 600
+SET: 67340.07 requests per second
+GET: 68775.79 requests per second
+[Port 6379][C 600]
+  -> 正在运行并发数: 800
+SET: 67430.88 requests per second
+GET: 64850.84 requests per second
+[Port 6379][C 800]
+  -> 正在运行并发数: 1000
+SET: 66137.57 requests per second
+GET: 61957.87 requests per second
+[Port 6379][C 1000]
+  -> 正在运行并发数: 1500
+SET: 62266.50 requests per second
+GET: 59808.61 requests per second
+[Port 6379][C 1500]
+  -> 正在运行并发数: 3000
+SET: 51361.07 requests per second
+GET: 52110.47 requests per second
+[Port 6379][C 3000]
+  -> 正在运行并发数: 5000
+SET: 57405.28 requests per second
+GET: 56915.20 requests per second
+[Port 6379][C 5000]
+  -> 正在运行并发数: 10000
+SET: 57836.90 requests per second
+GET: 56433.41 requests per second
