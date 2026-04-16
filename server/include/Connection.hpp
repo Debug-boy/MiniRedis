@@ -1,7 +1,3 @@
-//
-// Created by Administrator on 2026/4/12.
-//
-
 #ifndef MINIREDIS_CONNECTION_HPP
 #define MINIREDIS_CONNECTION_HPP
 
@@ -24,6 +20,7 @@ namespace MiniRedis {
         size_t sendOffset = 0;
         std::chrono::steady_clock::time_point lastActive = std::chrono::steady_clock::now();
         Channel fdContext{Channel::Type::Client, -1};
+        int role;
 
         [[nodiscard]] bool isExceedActiveDuration(const std::chrono::duration<uint64_t> duration) const {
             return (std::chrono::steady_clock::now() - this->lastActive) > duration;

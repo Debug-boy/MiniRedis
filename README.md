@@ -23,12 +23,23 @@ MiniRedis 当前实现了 RESP 协议解析、基础 KV 命令执行、epoll 事
 
 - **协议与命令**
   - 支持 RESP 请求解析与标准返回封装。
-  - 已实现命令：`GET`、`SET`、`DEL`、`EXISTS`、`PING`。
+  - 已实现命令：`GET`、`SET`、`DEL`、`EXISTS`、`PING`、`BGSAVE`。
 
 - **连接管理**
   - 非阻塞 socket + `EPOLLIN/EPOLLOUT` 动态注册。
   - 连接活跃时间统计，基于 `timerfd` 的空闲连接清理。
   - 输出缓冲区上限保护（`MaxPendingWriteBytes`）。
+
+- **信号统一管理**
+  - 使用 `signalfd` 将传统异步信号转换为文件描述符事件，统一纳入 `epoll` 事件循环处理
+  - 屏蔽信号（`sigprocmask`），避免信号默认处理方式干扰程序流程
+  - 注册的信号类型：
+    - `SIGCHLD`：子进程退出（用于回收 `BGSAVE` 等后台任务）
+    - `SIGPIPE`：写入已关闭 socket 时触发（避免进程异常退出）
+    - `SIGTERM`：进程终止信号（用于优雅关闭服务）
+  - 通过 `signalfd` + `epoll` 实现：
+    - 信号处理与网络事件统一调度
+    - 避免传统 signal handler 带来的异步安全问题
 
 - **可切换执行模型（单线程 / 多线程）**
   - 单线程路径：事件线程直接读写与执行（当前主路径）。
@@ -44,7 +55,7 @@ MiniRedis 当前实现了 RESP 协议解析、基础 KV 命令执行、epoll 事
 ### 3.1 模块分层
 
 - `server/src/server.cpp`
-  - 服务主入口、事件循环、连接生命周期、读写处理、命令执行调度。
+  - 服务主入口、事件循环、连接生命周期、读写处理、信号处理、命令执行调度。
 
 - `include/common/EventPool.hpp`
   - `epoll` 封装（`add/mod/del/wait`）。
@@ -61,8 +72,11 @@ MiniRedis 当前实现了 RESP 协议解析、基础 KV 命令执行、epoll 事
 - `include/common/Resp.hpp`
   - RESP 协议解析器与响应包装器。
 
-- `include/configure/Configure.hpp`
+- `include/ServerConfigure.hpp`
   - 运行时参数（监听端口、线程数、超时时间、写队列上限等）。
+  
+- `include/KeyValueDumper.hpp`
+  - 持久化能力（将当前存储的KV导出为专有的二进制数据库文件,默认文件名 `miniredis.dump`）。
 
 ### 3.2 事件循环主流程
 
@@ -104,6 +118,7 @@ MiniRedis 当前实现了 RESP 协议解析、基础 KV 命令执行、epoll 事
 - `GET key` -> `$<len>...` 或 `$-1`
 - `DEL key [key ...]` -> `:<removed_count>`
 - `EXISTS key [key ...]` -> `:<exists_count>`
+- `BGSAVE` -> `+OK`
 
 命令匹配由 `KvCommandEngine` 内部简单哈希分发完成。
 
@@ -120,6 +135,8 @@ MiniRedis 当前实现了 RESP 协议解析、基础 KV 命令执行、epoll 事
 ## 5.2 构建
 
 ```bash
+git clone --recursive https://github.com/Debug-boy/MiniRedis.git
+cd MiniRedis
 mkdir -p build
 cd build
 cmake .. -DCMAKE_BUILD_TYPE=Release
@@ -147,7 +164,7 @@ cmake --build . -j
 ## 6. Benchmark 说明（基于 `benchmark/data.txt`）
 
 ### 6.0 测试目标机器参数
-
+- 系统：Ubuntu 22.04.5 LTS
 - CPU：Intel(R) Xeon(R) Platinum × 1
 - 核心：1 个物理 CPU，4 个物理核心，8 个逻辑核心
 - 内存：16GB
@@ -183,33 +200,60 @@ cmake --build . -j
 
 ---
 
-## 7. 配置项（`Configure::ServerRuntime`）
+## 7. 配置项（`MiniRedis::ServerConfigure`） 【有新的调整和文件更改】
 
 主要参数包括：
 
-- `TcpListenPort`：默认 `9736`
-- `TcpListenAddress`：默认 `0.0.0.0`
-- `UnixSocketPath`：默认 `/tmp/miniredis.sock`
-- `WorkerNetIoThreads`：线程池线程数
-- `ClientIdleTimeout`：连接空闲超时
-- `IdleCheckInterval`：idle 检查间隔
-- `MaxPendingWriteBytes`：单连接待发送队列字节上限
+- `VERSION`：当前版本号
+- `TCP_LISTEN_PORT`：默认 `9736`
+- `TCP_LISTEN_ADDRESS`：默认 `0.0.0.0`
+- `UNIX_SOCKET_FILE_PATH`：默认 `/tmp/miniredis.sock`
+- `WORKER_NET_IO_THREADS`：线程池线程数
+- `CLIENT_IDLE_TIMEOUT`：连接空闲超时
+- `IDLE_CHECK_INTERVAL`：idle 检查间隔
+- `MAX_PENDING_WRITE_BYTES`：单连接待发送队列字节上限
+- `DUMP_SAVED_BINARY_FILE_PATH` ： 导出的二进制文件名称
+
+已经支持从配置文件 `xxx.conf` 动态加载配置，默认的配置文件 `miniredis.conf`
 
 ---
 
-## 8. 后续优化建议
+## 8.持久化 【新增】
+当前版本已经支持持久化能力，方式和Redis的RDB模式类似，也是将当前存储的KV导出成专有的二进制数据库文件
+
+导出的二进制数据库文件格式大致如下，图画的一般般大致就是这个意思
+```
+|--------------------------- Header ----------------------------|
+|   magic(16B) |    version(16B) |  kvCount(8B) | timestamp(8B) |
+|---------------------------- Header MD5 -----------------------|
+|              header_md5(16B)                                  |
+|----------------------------KV Body ---------------------------|
+| key_len(8B) | key_data(...) | value_len(8B) | value_data(...) |
+| key_len(8B) | key_data(...) | value_len(8B) | value_data(...) |
+| .....................Other KV................................ |
+|------------------------ KV Body MD5 --------------------------|
+|-----------------------kvbody_md5(16B)-------------------------|
+```
+
+服务端载入二进制数据库文件会进行MD5校验，只有校验通过才会加载里面的KV内容
+
+触发方式:
+
+    1.客户端主动使用`BGSAVE`
+    2.达到配置制定的触发策略
+---
+
+## 后续优化建议
 
 - 补齐更多 Redis 命令（如 `MGET/MSET/INCR/EXPIRE/TTL/CONFIG`）。
-- 将多线程路径做成可配置运行模式（启动参数或配置文件切换）。
 - 优化命令执行层：
   - 支持分片哈希表；
   - 并发安全策略（读写锁、分段锁或无锁结构）。
-- 增加 AOF/RDB 持久化能力。
+- 更换事件循环底层API为io_uring
 - 增加主从功能，以及cluster
-- 引入更系统化 benchmark 报告（P50/P99 延迟、CPU/内存、不同 payload）。
 
 ---
 
-## 9. 免责声明
+## 声明
 
 MiniRedis 当前定位为学习/实验性质的高性能服务端实现示例，并非完整替代官方 Redis。用于生产环境前，建议补齐持久化、主从复制、事务、脚本、安全鉴权等能力。

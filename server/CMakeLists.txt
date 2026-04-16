@@ -1,3 +1,5 @@
+find_package(OpenSSL REQUIRED)
+
 add_executable(miniredis-server
         src/server.cpp
 )
@@ -8,5 +10,9 @@ target_include_directories(miniredis-server
 )
 
 target_link_libraries(
-        miniredis-server PRIVATE spdlog::spdlog
+        miniredis-server
+        PRIVATE
+            spdlog::spdlog
+            OpenSSL::SSL
+            OpenSSL::Crypto
 )

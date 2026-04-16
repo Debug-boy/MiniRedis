@@ -10,7 +10,8 @@ namespace MiniRedis {
         class Wrapper {
         public:
             static std::string simpleString(const std::string &s) { return "+" + s + "\r\n"; }
-            static std::string ok() { return simpleString("OK"); }
+            static std::string pong(const std::string &s) { return "+PONG\r\n"; }
+            static std::string ok() { return "+OK\r\n"; }
             static std::string error(const std::string &msg) { return "-ERR " + msg + "\r\n"; }
 
             static std::string bulkString(const std::string &s) {

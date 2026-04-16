@@ -9,7 +9,8 @@ namespace MiniRedis {
             TcpListen,
             UnixListen,
             Timer,
-            Client
+            Client,
+            Signal
         };
 
         Type type;

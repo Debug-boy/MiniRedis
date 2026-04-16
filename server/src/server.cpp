@@ -1,3 +1,4 @@
+#include <getopt.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/uio.h>
@@ -5,11 +6,16 @@
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <sys/resource.h>
+#include <sys/signalfd.h>
+#include <sys/wait.h>
 #include <arpa/inet.h>
 #include <netinet/tcp.h>
 #include <csignal>
+#include <filesystem>
 
 #include <iostream>
+
+#include "ServerConfigure.hpp"
 
 #include "common/EventPool.hpp"
 #include "common/ThreadPool.hpp"
@@ -17,32 +23,33 @@
 
 #include "KvCommandEngine.hpp"
 #include "Connection.hpp"
-
-#include "configure/Configure.hpp"
+#include "KeyValueDumper.hpp"
 
 #include <spdlog/spdlog.h>
 
 namespace MiniRedis {
 
-    class Server {
+    class Server : public Singleton<Server>{
+        friend class Singleton<Server>;
     private:
         struct PendingCloseStruct {
             std::shared_ptr<Connection> connection;
             std::string reason;
         };
+
         EventPool eventPool;
-        ThreadPool threadPool{Configure::ServerRuntime::WorkerNetIoThreads};
+        std::unique_ptr<ThreadPool> threadPool;
         KvCommandEngine engine;
 
         int tcpSocketListenFd = -1;
         int unixSocketListenFd = -1;
+        int signalFd = -1;
         int timerFd = -1;
 
         std::unique_ptr<Channel> tcpListenChannel;
         std::unique_ptr<Channel> unixSocketChannel;
         std::unique_ptr<Channel> timerChannel;
-
-        std::atomic<bool> isStop;
+        std::unique_ptr<Channel> signalChannel;
 
         std::unordered_map<int, std::shared_ptr<Connection> > connectionsMap;
         LockFreeQueue<std::shared_ptr<Connection> > pendingExecCommandedConnectionQueue;
@@ -57,6 +64,7 @@ namespace MiniRedis {
             registerTcpListenEvent();
             registerUnixListenEvent();
             registerTimerClickEvent();
+            registerSignalEvent();
         }
 
         ~Server() {
@@ -65,30 +73,43 @@ namespace MiniRedis {
                     kv.second->closeSocketOnly();
                 }
             }
+            if (tcpSocketListenFd != -1) {
+                ::close(tcpSocketListenFd);
+            }
+            if (unixSocketListenFd != -1) {
+                ::close(unixSocketListenFd);
+            }
             if (timerFd != -1) {
                 ::close(timerFd);
             }
-            if (tcpSocketListenFd != -1) {
-                ::close(tcpSocketListenFd);
+            if (signalFd != -1) {
+                ::close(signalFd);
             }
         }
 
         void eventLoop() {
             spdlog::info("The server has successfully initiated the event loop.");
 
+            /*
+             *The thread pool can only be created after registering with the signal masking set;
+             *otherwise, the child threads or processes will not inherit the signal masking strategy
+             */
+            //threadPool = std::make_unique<ThreadPool>(ServerConfigure::WorkerNetIoThreads);
+
             std::vector<epoll_event> ready(SOMAXCONN);
 
-            while (!isStop.load()) {
+            for (;;) {
                 const int readyEventNumberOf = eventPool.wait(ready.data(), static_cast<int>(ready.size()), -1);
 
-                if (readyEventNumberOf == -1) {
-                    throw std::runtime_error(getSysLastError("epoll_wait"));
+                if (readyEventNumberOf == -1 && errno == EINTR) {
+                    spdlog::warn("{}",getSysLastError("epoll_wait"));
+                    continue;
                 }
 
-                std::vector<std::shared_ptr<Connection>> needReadConnections;
+                std::vector<std::shared_ptr<Connection> > needReadConnections;
                 needReadConnections.reserve(readyEventNumberOf);
 
-                std::vector<std::shared_ptr<Connection>> needWriteConnections;
+                std::vector<std::shared_ptr<Connection> > needWriteConnections;
                 needWriteConnections.reserve(readyEventNumberOf);
 
                 for (int i = 0; i < readyEventNumberOf; ++i) {
@@ -99,28 +120,7 @@ namespace MiniRedis {
 
                     const uint32_t ev = ready[i].events;
 
-                    if (channel->type == Channel::Type::TcpListen) {
-                        if (ev & (EPOLLERR | EPOLLHUP)) {
-                            throw std::runtime_error("listen tcp socket fd error ev=0x{:x}");
-                        }
-                        if (ev & EPOLLIN) {
-                            handleAccept(tcpSocketListenFd);
-                        }
-                    }else if (channel->type == Channel::Type::UnixListen) {
-                        if (ev & (EPOLLERR | EPOLLHUP)) {
-                            throw std::runtime_error("listen unix socket fd error ev=0x{:x}");
-                        }
-                        if (ev & EPOLLIN) {
-                            handleAccept(unixSocketListenFd);
-                        }
-                    } else if (channel->type == Channel::Type::Timer) {
-                        if (ev & (EPOLLERR | EPOLLHUP)) {
-                            throw std::runtime_error("timerfd event error: ev=0x{:x}");
-                        }
-                        if (ev & EPOLLIN) {
-                            handleTimerTick();
-                        }
-                    } else if (channel->type == Channel::Type::Client) {
+                    if (channel->type == Channel::Type::Client) {
                         auto node = connectionsMap.find(channel->fd);
                         if (node == connectionsMap.end()) {
                             spdlog::error("client({}) not found", channel->fd);
@@ -137,8 +137,37 @@ namespace MiniRedis {
                         if (ev & EPOLLOUT) {
                             needWriteConnections.push_back(connection);
                         }
+                    } else if (channel->type == Channel::Type::TcpListen) {
+                        if (ev & (EPOLLERR | EPOLLHUP)) {
+                            throw std::runtime_error("listen tcp socket fd error ev=0x{:x}");
+                        }
+                        if (ev & EPOLLIN) {
+                            handleAccept(tcpSocketListenFd);
+                        }
+                    } else if (channel->type == Channel::Type::UnixListen) {
+                        if (ev & (EPOLLERR | EPOLLHUP)) {
+                            throw std::runtime_error("listen unix socket fd error ev=0x{:x}");
+                        }
+                        if (ev & EPOLLIN) {
+                            handleAccept(unixSocketListenFd);
+                        }
+                    } else if (channel->type == Channel::Type::Timer) {
+                        if (ev & (EPOLLERR | EPOLLHUP)) {
+                            throw std::runtime_error("timerfd event error: ev=0x{:x}");
+                        }
+                        if (ev & EPOLLIN) {
+                            handleTimerTick();
+                        }
+                    } else if (channel->type == Channel::Type::Signal) {
+                        if (ev & (EPOLLERR | EPOLLHUP)) {
+                            throw std::runtime_error("signal event error: ev=0x{:x}");
+                        }
+                        if (ev & EPOLLIN) {
+                            handleSignal();
+                        }
                     }
-                }//end for()
+
+                } //end for()
 
                 if (!needReadConnections.empty()) {
                     //threadPoolBatchReadQueryBufferAndWait(needReadConnections);
@@ -153,26 +182,44 @@ namespace MiniRedis {
                     execPendingCloseConnection();
                 }
 
+                const auto dirtyFrequency = engine.accumulateDurationDirtyCount();
+                for (const auto& triggerPolicy : ServerConfigure::DUMP_TRIGGER_POLICIES) {
+                    if (
+                        dirtyFrequency >= triggerPolicy.dirtyThreshold &&
+                        std::chrono::steady_clock::now() - KeyValueDumper::getInstance().lastDumperTriggerTimePoint >= triggerPolicy.millisecond) {
+                        spdlog::info("dump trigger condition is ({} millisecond,{} dirtyThreshold)",triggerPolicy.millisecond.count(),triggerPolicy.dirtyThreshold);
+                        KeyValueDumper::getInstance().dump(
+                            ServerConfigure::DUMP_SAVED_BINARY_FILE_PATH,
+                            ServerConfigure::VERSION,
+                            engine.store,
+                            true);
+                        break;
+                    }
+                }
+
             }
 
             spdlog::warn("event loop is over!");
         }
 
-        void stop() {
-            isStop.store(true);
+        void recoverDatabasesFormBinaryFile(const std::optional<std::string_view> &filePath) {
+            if (!filePath.has_value()) {
+                return;
+            }
+            KeyValueDumper::getInstance().loader(filePath.value(),engine.store);
         }
 
     private:
-
         static void commonCheckKernelParameter() {
             struct rlimit rlim{};
             if (getrlimit(RLIMIT_NOFILE, &rlim) == -1) {
                 spdlog::error(getSysLastError("getrlimit failed"));
                 return;
             }
-            spdlog::info("software file descript restrict max {}",rlim.rlim_cur);
-            spdlog::info("hardware file descript restrict max {}",rlim.rlim_cur);
+            spdlog::info("software file descript restrict max {}", rlim.rlim_cur);
+            spdlog::info("hardware file descript restrict max {}", rlim.rlim_cur);
         }
+
 
         void setupTcpSocketListen() {
             tcpSocketListenFd = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
@@ -199,7 +246,7 @@ namespace MiniRedis {
             sockaddr_in bindAddress{};
             bindAddress.sin_family = AF_INET;
             bindAddress.sin_addr.s_addr = htonl(INADDR_ANY);
-            bindAddress.sin_port = htons(Configure::ServerRuntime::TcpListenPort);
+            bindAddress.sin_port = htons(ServerConfigure::TCP_LISTEN_PORT);
 
             if (::bind(tcpSocketListenFd, reinterpret_cast<sockaddr *>(&bindAddress), sizeof(bindAddress)) == -1) {
                 throw std::runtime_error(getSysLastError("bind tcp socket error"));
@@ -211,8 +258,8 @@ namespace MiniRedis {
                 throw std::runtime_error(getSysLastError("listen tcp socket error"));
             }
 
-            spdlog::info("listen tcp socket on the {}:{} success.",Configure::ServerRuntime::TcpListenAddress,
-                Configure::ServerRuntime::TcpListenPort);
+            spdlog::info("listen tcp socket on the {}:{} success.", ServerConfigure::TCP_LISTEN_ADDRESS,
+                         ServerConfigure::TCP_LISTEN_PORT);
         }
 
         void setupUnixSocketListen() {
@@ -227,11 +274,11 @@ namespace MiniRedis {
                 throw std::runtime_error(getSysLastError("fcntl"));
             }
 
-            unlink(Configure::ServerRuntime::UnixSocketPath.c_str());
+            unlink(ServerConfigure::UNIX_SOCKET_FILE_PATH.c_str());
 
             sockaddr_un bindAddress{};
             bindAddress.sun_family = AF_UNIX;
-            strncpy(bindAddress.sun_path,Configure::ServerRuntime::UnixSocketPath.c_str(),sizeof(bindAddress.sun_path));
+            strncpy(bindAddress.sun_path, ServerConfigure::UNIX_SOCKET_FILE_PATH.c_str(), sizeof(bindAddress.sun_path));
             if (::bind(unixSocketListenFd, reinterpret_cast<sockaddr *>(&bindAddress), sizeof(bindAddress)) != 0) {
                 throw std::runtime_error(getSysLastError("bind unix socket error"));
             }
@@ -242,7 +289,7 @@ namespace MiniRedis {
                 throw std::runtime_error(getSysLastError("listen unix socket error"));
             }
 
-            spdlog::info("listen unix socket on the {} success.",Configure::ServerRuntime::UnixSocketPath.c_str());
+            spdlog::info("listen unix socket on the {} success.", ServerConfigure::UNIX_SOCKET_FILE_PATH.c_str());
         }
 
         void setupIdleTimer() {
@@ -252,8 +299,8 @@ namespace MiniRedis {
             }
 
             itimerspec spec{};
-            spec.it_interval.tv_sec = Configure::ServerRuntime::IdleCheckInterval.count();
-            spec.it_value.tv_sec = Configure::ServerRuntime::IdleCheckInterval.count();
+            spec.it_interval.tv_sec = ServerConfigure::IDLE_CHECK_INTERVAL.count();
+            spec.it_value.tv_sec = ServerConfigure::IDLE_CHECK_INTERVAL.count();
             if (::timerfd_settime(timerFd, 0, &spec, nullptr) == -1) {
                 throw std::runtime_error(getSysLastError("timerfd_settime"));
             }
@@ -272,6 +319,19 @@ namespace MiniRedis {
         void registerTimerClickEvent() {
             timerChannel = std::make_unique<Channel>(Channel::Type::Timer, timerFd);
             eventPool.add(timerFd, EPOLLIN | EPOLLERR | EPOLLHUP, timerChannel.get());
+        }
+
+        void registerSignalEvent() {
+            sigset_t mask;
+            sigemptyset(&mask);
+            sigaddset(&mask, SIGCHLD);
+            //sigaddset(&mask, SIGINT);
+            sigaddset(&mask, SIGPIPE);
+            sigaddset(&mask, SIGTERM);
+            sigprocmask(SIG_BLOCK, &mask, nullptr);
+            signalFd = signalfd(-1, &mask, SFD_NONBLOCK | SFD_CLOEXEC);
+            signalChannel = std::make_unique<Channel>(Channel::Type::Signal, signalFd);
+            eventPool.add(signalFd, EPOLLIN | EPOLLERR | EPOLLHUP, signalChannel.get());
         }
 
         void addConnection(int clientFd, const bool isUnixSocket) {
@@ -293,7 +353,8 @@ namespace MiniRedis {
             connectionsMap.emplace(clientFd, connection);
         }
 
-        void singletonThreadReadQueryBuffer(const std::vector<std::shared_ptr<Connection> > &pendingHandleReadConnections) {
+        void singletonThreadReadQueryBuffer(
+            const std::vector<std::shared_ptr<Connection> > &pendingHandleReadConnections) {
             for (auto &conn: pendingHandleReadConnections) {
                 handleRead(conn);
             }
@@ -308,8 +369,8 @@ namespace MiniRedis {
                     handleRead(conn);
                 });
             }
-            threadPool.submitBatch(tasks);
-            threadPool.wait();
+            threadPool->submitBatch(tasks);
+            threadPool->wait();
         }
 
         void singletonThreadWriteReply(std::vector<std::shared_ptr<Connection> > &pendingHandleWriteConnections) {
@@ -327,8 +388,8 @@ namespace MiniRedis {
                     handleWrite(conn);
                 });
             }
-            threadPool.submitBatch(tasks);
-            threadPool.wait();
+            threadPool->submitBatch(tasks);
+            threadPool->wait();
         }
 
         void handleAccept(const int listenedFd) {
@@ -337,11 +398,11 @@ namespace MiniRedis {
                 sockaddr_un unixSocketAddr{};
                 int clientFd = -1;
                 socklen_t socketTypeSize = -1;
-                sockaddr* xSockaddr = nullptr;
+                sockaddr *xSockaddr = nullptr;
                 if (listenedFd == this->tcpSocketListenFd) {
                     socketTypeSize = sizeof(tcpSocketAddr);
                     xSockaddr = reinterpret_cast<sockaddr *>(&tcpSocketAddr);
-                }else {
+                } else {
                     socketTypeSize = sizeof(unixSocketAddr);
                     xSockaddr = reinterpret_cast<sockaddr *>(&unixSocketAddr);
                 }
@@ -352,8 +413,9 @@ namespace MiniRedis {
                     if (xSockaddr->sa_family == AF_INET) {
                         char ipv4[INET_ADDRSTRLEN]{};
                         inet_ntop(AF_INET, &tcpSocketAddr.sin_addr, ipv4, sizeof(ipv4));
-                        spdlog::info("new tcp connection : {}:{} (fd={})", ipv4,ntohs(tcpSocketAddr.sin_port), clientFd);
-                    }else {
+                        spdlog::info("new tcp connection : {}:{} (fd={})", ipv4,ntohs(tcpSocketAddr.sin_port),
+                                     clientFd);
+                    } else {
                         spdlog::info("new unix connection : (fd={})", &unixSocketAddr.sun_path[1], clientFd);
                     }
 
@@ -382,8 +444,46 @@ namespace MiniRedis {
 
             for (auto &node: connectionsMap) {
                 auto &connection = node.second;
-                if (connection->isExceedActiveDuration(Configure::ServerRuntime::ClientIdleTimeout)) {
+                if (connection->isExceedActiveDuration(ServerConfigure::CLIENT_IDLE_TIMEOUT)) {
                     closeConnection(connection, "idle timeout");
+                }
+            }
+        }
+
+        void handleSignal() const {
+            struct signalfd_siginfo signalDetailInformation;
+            for (;;) {
+                ssize_t n = read(signalFd, &signalDetailInformation, sizeof(signalDetailInformation));
+                if (n > 0) {
+                    if (signalDetailInformation.ssi_signo == SIGCHLD) {
+                        spdlog::warn("received SIGCHLD");
+                        int status;
+                        pid_t pid;
+                        while ((pid = waitpid(-1, &status, WNOHANG)) > 0) {
+                            auto bgSaveDuration =
+                                std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - KeyValueDumper::getInstance().lastDumperTriggerTimePoint);
+                            if (WIFEXITED(status)) {
+                                const int exitCode = WEXITSTATUS(status);
+                                if (exitCode == 1) {
+                                    spdlog::info("The child({}) process is normal exit({}),accumulated {} milliseconds",pid,exitCode,bgSaveDuration.count());
+                                }else {
+                                    spdlog::info("The child({}) process is exception exit({}),accumulated {} milliseconds",pid,exitCode,bgSaveDuration.count());
+                                }
+                                KeyValueDumper::getInstance().lastForkedChildProcessPid = -1;
+                            } else if (WIFSIGNALED(status)) {
+                                const int signalCode = WTERMSIG(status);
+                                spdlog::error("The child({}) process was killed by a signal({}).",pid,signalCode);
+                            }
+                        }
+                    }else if (signalDetailInformation.ssi_signo == SIGTERM) {
+                        spdlog::warn("received SIGTERM");
+                    }else if (signalDetailInformation.ssi_signo == SIGINT) {
+                        spdlog::warn("received SIGINT");
+                    }else if (signalDetailInformation.ssi_signo == SIGPIPE) {
+                        spdlog::warn("received SIGPIPE");
+                    }
+                }else if (errno != EINTR) {
+                    break;
                 }
             }
         }
@@ -415,7 +515,6 @@ namespace MiniRedis {
         }
 
         void handleWrite(const std::shared_ptr<Connection> &connection) {
-
             if (!connection)
                 return;
 
@@ -429,12 +528,14 @@ namespace MiniRedis {
                 struct iovec buffers[MAX_IOVEC_SIZE]{};
                 int paddingBufferCount = 0;
 
-                buffers[0].iov_base = static_cast<void *>(connection->replyQueue.front().data() + connection->sendOffset);
+                buffers[0].iov_base = static_cast<void *>(
+                    connection->replyQueue.front().data() + connection->sendOffset);
                 buffers[0].iov_len = connection->replyQueue.front().size() - connection->sendOffset;
                 ++paddingBufferCount;
 
-                for (int i = 1 ; (i < connection->replyQueue.empty()) && (paddingBufferCount < MAX_IOVEC_SIZE) ; ++i,++paddingBufferCount) {
-                    auto& replyChunk = connection->replyQueue[i];
+                for (int i = 1; (i < connection->replyQueue.empty()) && (paddingBufferCount < MAX_IOVEC_SIZE);
+                     ++i, ++paddingBufferCount) {
+                    auto &replyChunk = connection->replyQueue[i];
                     buffers[paddingBufferCount].iov_base = replyChunk.data();
                     buffers[paddingBufferCount].iov_len = replyChunk.size();
                 }
@@ -459,13 +560,12 @@ namespace MiniRedis {
                             connection->replyBytes -= buffers[i].iov_len;
                             if (sentBytes == buffers[i].iov_len) {
                                 connection->replyQueue.pop_front();
-                            }else {
+                            } else {
                                 connection->sendOffset = sentBytes;
                             }
                         }
                     }
-                }else {
-
+                } else {
                     if (sentByteNumberOf == -1 && errno == EINTR) {
                         continue;
                     }
@@ -505,7 +605,8 @@ namespace MiniRedis {
         void execClientRespCommands() {
             pendingExecCommandedConnectionQueue.pop_all([this](const std::shared_ptr<Connection> &connection) {
                 while (!connection->argvPipeline.empty()) {
-                    auto execResult = engine.execute(connection->argvPipeline.front());
+                    const auto& argv = connection->argvPipeline.front();
+                    auto execResult = engine.execute(argv);
                     if (!enqueueReply(connection, std::move(execResult))) {
                         pushConnectionToCloseQueue(connection, "output reply queue overflow");
                     }
@@ -519,12 +620,12 @@ namespace MiniRedis {
                 return false;
             }
 
-            if (connection->replyBytes + reply.size() > Configure::ServerRuntime::MaxPendingWriteBytes) {
+            if (connection->replyBytes + reply.size() > ServerConfigure::MAX_PENDING_WRITE_BYTES) {
                 spdlog::warn("fd={} output queue overflow: current={}, incoming={}, limit={}",
                              connection->socketFd,
                              connection->replyBytes,
                              reply.size(),
-                             Configure::ServerRuntime::MaxPendingWriteBytes);
+                             ServerConfigure::MAX_PENDING_WRITE_BYTES);
                 return false;
             }
             connection->replyBytes += reply.size();
@@ -573,40 +674,64 @@ namespace MiniRedis {
         void execPendingCloseConnection() {
             //spdlog::info("exec pending close connection");
             pendingCloseQueue.pop_all([this](const PendingCloseStruct &item) {
-                closeConnection(item.connection,item.reason);
+                closeConnection(item.connection, item.reason);
             });
         }
     };
-
 } // namespace MiniRedis
 
-void signalHandler(const int signalCode) {
-    std::string_view signalName;
-    switch (signalCode) {
-        case SIGINT:  signalName = "SIGINT";  break; // Ctrl+C
-        case SIGTERM: signalName = "SIGTERM"; break; // kill
-        case SIGPIPE: signalName = "SIGPIPE"; break; // PIPE/Socket close
-        case SIGSEGV: signalName = "SIGSEGV"; break; // Segment Error
-        default: signalName = "Unknown";
-    }
-    spdlog::warn("Received signal: {} {}",signalName,signalCode);
+struct ParameterOptions {
+    std::optional<std::string_view> configPath;
+    std::optional<std::string_view> database;
+};
+
+void Usage(const char* prog) {
+    std::cout << "Usage: " << prog << " [OPTIONS]\n\n"
+              << "Options:\n"
+              << "  -v, --version            Show version\n"
+              << "  -c, --config <file>      Config file path (optional)\n"
+              << "  -d, --database <file>    Database file path (optional)\n"
+              << "  -h, --help               Show this help\n";
 }
 
-int main(int argc, const char *argv[]) {
+int main(const int argc, const char *argv[]) {
 
-    //std::signal(SIGINT, signalHandler);
-    std::signal(SIGTERM, signalHandler);
-    std::signal(SIGPIPE, signalHandler);
-    std::signal(SIGSEGV, signalHandler);
+    constexpr option long_opts[] = {
+        {"version", no_argument, nullptr, 'v'},
+        {"config",  required_argument, nullptr, 'c'},
+        {"database", required_argument, nullptr, 'd'},
+        {nullptr,   0,                 nullptr,  0 }
+    };
+
+    int opt;
+    ParameterOptions parameterOptions;
+    while ((opt = getopt_long(argc, const_cast<char* const*>(argv),"vc:d:", long_opts, nullptr)) != -1) {
+        switch (opt) {
+            case 'v':
+                std::cout << "Version " << MiniRedis::ServerConfigure::VERSION << std::endl;
+                return 0;
+            case 'c':
+                parameterOptions.configPath = optarg;
+                break;
+            case 'm':
+                parameterOptions.database = optarg;
+                break;
+            default:
+                std::cout << "Unknown option: " << opt << std::endl;
+                return -1;
+        }
+    }
 
     spdlog::set_pattern("[%Y-%m-%d %H:%M:%S.%e] [%^%l%$] [tid %t] %v");
     spdlog::set_level(spdlog::level::info);
 
-
-    static MiniRedis::Server server;
+    MiniRedis::ServerConfigure::loader(parameterOptions.configPath.value_or(MiniRedis::ServerConfigure::DEFAULT_CONFIG_FILE_PATH));
+    MiniRedis::KeyValueDumper::init();
+    MiniRedis::Server::init();
+    MiniRedis::Server::getInstance().recoverDatabasesFormBinaryFile(parameterOptions.database.value_or(MiniRedis::ServerConfigure::DEFAULT_DUMP_BINARY_FILE_PATH));
 
     try {
-        server.eventLoop();
+        MiniRedis::Server::getInstance().eventLoop();
     } catch (const std::exception &ex) {
         spdlog::critical("fatal: {}", ex.what());
         return 1;
